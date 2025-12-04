@@ -9,7 +9,7 @@ from app.images import imagekit
 from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
 import shutil
 import os
-import uuid
+from uuid import UUID
 import tempfile
 
 @asynccontextmanager
@@ -81,34 +81,18 @@ async def get_feed(
         )
     return {'posts': posts_data}
 
-# text_posts = {
-#     1: {"title": "First post ever", "content": "Finally launched my mini social app!"},
-#     2: {"title": "Morning vibes", "content": "Coffee in one hand, FastAPI in the other"},
-#     3: {"title": "Just shipped", "content": "My backend is now live and running"},
-#     4: {"title": "Late night coding", "content": "Sleep is for people without deadlines"},
-#     5: {"title": "Learning in public", "content": "Building a social app from scratch, one endpoint at a time"},
-#     6: {"title": "FastAPI is love", "content": "This framework makes backend development actually fun"},
-#     7: {"title": "Hello world", "content": "Officially joining the dev community today"},
-#     8: {"title": "Weekend project", "content": "Turned an idea into a working API in 48 hours"},
-#     9: {"title": "Feeling proud", "content": "From zero to a working social platform"},
-#     10: {"title": "Next step", "content": "Adding likes and comments tomorrow"}
-# }
+@app.delete('/posts/{post_id}')
+async def delete_post(
+    post_id: UUID,
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).where(Post.id == post_id))
+    post = result.scalars().first()
 
-@app.get('/posts')
-def get_all_posts(limit: int = None):
-    if limit:
-        return list(text_posts.values())[:limit]
-    return text_posts
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
 
-@app.get('/posts/{id}')
-def get_post(id: int):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail='post not found')
-    return text_posts.get(id)
+    await session.delete(post)
+    await session.commit()
 
-@app.post('/posts')
-def create_post(post: PostCreate) -> PostResponse:
-    new_post = {'title': post.title, 'content': post.content}
-    text_posts[max(text_posts.keys()) + 1] = new_post
-    return new_post
-
+    return {"success": True, "message": "Post deleted successfully"}
