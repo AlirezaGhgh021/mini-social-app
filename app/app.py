@@ -1,10 +1,10 @@
-from fastapi import File, UploadFile, Form, Depends, FastAPI, HTTPException
+from fastapi import File, UploadFile, Form, Depends, FastAPI, HTTPException, Body
 
 from app.schemas import PostCreate, PostResponse, UserCreate, UserUpdate, UserRead
-from app.db import User, Post, create_db_and_tables, get_async_session
+from app.db import User, Post, create_db_and_tables, get_async_session, Like, Comment
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
-from sqlalchemy import select
+from sqlalchemy import select, func
 from app.images import imagekit
 from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
 import shutil
@@ -12,8 +12,8 @@ import os
 from uuid import UUID
 import tempfile
 from app.users import auth_backend, current_active_user, fastapi_users
-
-
+from typing import Optional
+from sqlalchemy.orm import joinedload
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,34 +71,43 @@ async def upload_file(
             os.unlink(temp_file_path)
         file.file.close()
 
+optional_current_user = fastapi_users.current_user(active=True, optional=True)
+
 @app.get('/feed')
 async def get_feed(
         session: AsyncSession = Depends(get_async_session),
-        user: User = Depends(current_active_user),
+        user: Optional[User] = Depends(optional_current_user)
 ):
-    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
-    posts = [row[0] for row in result.all()]
+    # EAGER LOAD EVERYTHING — NO LAZY LOADING
+    result = await session.execute(
+        select(Post)
+        .options(
+            joinedload(Post.user),
+            joinedload(Post.likes).joinedload(Like.user)
+        )
+        .order_by(Post.created_at.desc())
+    )
 
-    result = await session.execute(select(User))
-    users = [row[0] for row in result.all()]
-    user_dict = {u.id: u.email for u in users}
+    # THIS IS THE ONLY LINE THAT WORKS — .unique() IS REQUIRED
+    posts = result.unique().scalars().all()
 
     posts_data = []
-    for post in posts:
-        posts_data.append(
-            {
-                'id': str(post.id),
-                'user_id': str(post.user_id),
-                'caption': post.caption,
-                'url': post.url,
-                'file_type': post.file_type,
-                'file_name': post.file_name,
-                'created_at': post.created_at.isoformat(),
-                'is_owner': post.user_id == user.id,
-                'email': user_dict.get(post.user_id, 'Unknown')
-            }
-        )
-    return {'posts': posts_data}
+    for p in posts:
+        posts_data.append({
+            "id": str(p.id),
+            "caption": p.caption or "",
+            "url": p.url,
+            "file_type": p.file_type,
+            "file_name": p.file_name,
+            "created_at": p.created_at.isoformat(),
+            "is_owner": user is not None and p.user_id == user.id,
+            "email": p.user.email.split("@")[0] if p.user else "unknown",
+            "like_count": len(p.likes),
+            "is_liked": user is not None and any(l.user_id == user.id for l in p.likes),
+            "comments": []  # we'll add real comments next
+        })
+
+    return {"posts": posts_data}
 
 @app.delete('/posts/{post_id}')
 async def delete_post(
@@ -119,3 +128,87 @@ async def delete_post(
     await session.commit()
 
     return {"success": True, "message": "Post deleted successfully"}
+
+# ────────────────────── LIKE ENDPOINTS ──────────────────────
+@app.post("/posts/{post_id}/like")
+async def like_post(
+    post_id: UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    # Check if post exists
+    post = await session.get(Post, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+
+    # Check if already liked
+    existing = await session.execute(
+        select(Like).where(Like.user_id == user.id, Like.post_id == post_id)
+    )
+    if existing.scalars().first():
+        return {"detail": "Already liked"}
+
+    like = Like(user_id=user.id, post_id=post_id)
+    session.add(like)
+    await session.commit()
+    return {"detail": "Liked successfully"}
+
+
+@app.delete("/posts/{post_id}/like")
+async def unlike_post(
+    post_id: UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(
+        select(Like).where(Like.user_id == user.id, Like.post_id == post_id)
+    )
+    like = result.scalars().first()
+
+    if not like:
+        raise HTTPException(status_code=404, detail="Not liked yet")
+
+    await session.delete(like)
+    await session.commit()
+    return {"detail": "Unliked"}
+
+# ----------------comment endpoints
+@app.post("/posts/{post_id}/comment")
+async def add_comment(
+    post_id: UUID,
+    content: str = Body(..., embed=True),
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    post = await session.get(Post, post_id)
+    if not post:
+        raise HTTPException(404, "Post not found")
+
+    comment = Comment(post_id=post_id, user_id=user.id, content=content)
+    session.add(comment)
+    await session.commit()
+    await session.refresh(comment)
+
+    return {
+        "id": str(comment.id),
+        "content": comment.content,
+        "user_email": user.email.split("@")[0],
+        "created_at": comment.created_at.isoformat(),
+        "is_owner": True
+    }
+
+@app.delete("/comments/{comment_id}")
+async def delete_comment(
+    comment_id: UUID,
+    user: User = Depends(current_active_user),
+    session: AsyncSession = Depends(get_async_session)
+):
+    comment = await session.get(Comment, comment_id)
+    if not comment:
+        raise HTTPException(404, "Comment not found")
+    if comment.user_id != user.id:
+        raise HTTPException(403, "Not your comment")
+
+    await session.delete(comment)
+    await session.commit()
+    return {"detail": "Comment deleted"}

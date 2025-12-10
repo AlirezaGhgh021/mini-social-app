@@ -1,6 +1,8 @@
+# app/db.py
+
+import uuid
 from datetime import datetime
 from collections.abc import AsyncGenerator
-import uuid
 
 from fastapi import Depends
 from fastapi_users.db import SQLAlchemyUserDatabase, SQLAlchemyBaseUserTableUUID
@@ -10,10 +12,11 @@ from sqlalchemy import (
     String,
     DateTime,
     ForeignKey,
+    UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.types import Uuid  # ← This is the universal UUID type
 
 
 DATABASE_URL = "sqlite+aiosqlite:///./test.db"
@@ -25,30 +28,53 @@ class Base(DeclarativeBase):
 
 # ────────────────────────── USER ──────────────────────────
 class User(SQLAlchemyBaseUserTableUUID, Base):
-    """
-    fastapi-users gives us id, email, hashed_password, is_active, etc.
-    We only add the reverse relationship to posts.
-    """
     posts = relationship("Post", back_populates="user", cascade="all, delete-orphan")
+    liked_posts = relationship("Like", back_populates="user")
 
 
 # ────────────────────────── POST ──────────────────────────
 class Post(Base):
     __tablename__ = "posts"
 
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(PG_UUID(as_uuid=True), ForeignKey("user.id"), nullable=False)
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid, ForeignKey("user.id"), nullable=False)
 
     caption = Column(Text, nullable=True)
     url = Column(String, nullable=False)
     file_type = Column(String, nullable=False)
     file_name = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.now, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
-    # Reverse side
     user = relationship("User", back_populates="posts")
+    likes = relationship("Like", back_populates="post")
+    comments = relationship("Comment", back_populates="post", cascade="all, delete-orphan")
 
+# ────────────────────────── LIKE ──────────────────────────
+class Like(Base):
+    __tablename__ = "likes"
 
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id = Column(Uuid, ForeignKey("user.id"), nullable=False)
+    post_id = Column(Uuid, ForeignKey("posts.id"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "post_id", name="unique_like"),)
+
+    user = relationship("User", back_populates="liked_posts")
+    post = relationship("Post", back_populates="likes")
+
+# ----------comments------------
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id = Column(Uuid, primary_key=True, default=uuid.uuid4)
+    post_id = Column(Uuid, ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Uuid, ForeignKey("user.id"), nullable=False)
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User")
+    post = relationship("Post", back_populates="comments")
 # ──────────────────────── ENGINE & SESSION ────────────────────────
 engine = create_async_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
